@@ -16,11 +16,28 @@ jobs:
 
       - name: Check project ZIP
         run: |
+          set -euo pipefail
+
           test -f LUNA-Genuine-Neural-Luna-GitHub-Ready.zip
+
+          unzip -t LUNA-Genuine-Neural-Luna-GitHub-Ready.zip >/dev/null
+
+          echo "LUNA project ZIP verified."
 
       - name: Extract LUNA project
         run: |
+          set -euo pipefail
+
+          rm -rf project
+          mkdir -p project
+
           unzip -q LUNA-Genuine-Neural-Luna-GitHub-Ready.zip -d project
+
+          test -f project/settings.gradle.kts
+          test -f project/app/build.gradle.kts
+          test -f project/app/src/main/AndroidManifest.xml
+
+          echo "LUNA project extracted and verified."
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -35,6 +52,8 @@ jobs:
 
       - name: Configure Android SDK
         run: |
+          set -euo pipefail
+
           echo "ANDROID_HOME=$ANDROID_HOME"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
 
@@ -43,16 +62,24 @@ jobs:
           echo "$ANDROID_HOME/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
           echo "$ANDROID_HOME/platform-tools" >> "$GITHUB_PATH"
 
+          command -v sdkmanager
           sdkmanager --version
 
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
 
       - name: Install Android SDK packages
         run: |
+          set -euo pipefail
+
           sdkmanager \
             "platform-tools" \
             "platforms;android-36" \
             "build-tools;36.0.0"
+
+          test -d "$ANDROID_HOME/platforms/android-36"
+          test -d "$ANDROID_HOME/build-tools/36.0.0"
+
+          echo "Android SDK packages verified."
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
@@ -61,38 +88,351 @@ jobs:
 
       - name: Prepare genuine neural Luna model
         working-directory: project
+        shell: bash
         run: |
+          set -euo pipefail
+
+          VERSION="1.13.8"
+          MODEL_NAME="sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"
+
+          MODEL_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/${MODEL_NAME}.tar.bz2"
+
+          AAR_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/v${VERSION}/sherpa-onnx-${VERSION}.aar"
+
+          ASSETS="app/src/main/assets/luna_kws"
+          LIBS="app/libs"
+
+          TMP="$(mktemp -d)"
+
+          cleanup() {
+            rm -rf "$TMP"
+          }
+
+          trap cleanup EXIT
+
+          mkdir -p "$ASSETS"
+          mkdir -p "$LIBS"
+
+          echo "Installing model-preparation dependencies..."
+
           python3 -m pip install --quiet --upgrade pip
-
           python3 -m pip install --quiet \
-            sentencepiece \
-            pypinyin
+            "sentencepiece" \
+            "pypinyin" \
+            "sherpa-onnx==${VERSION}"
 
-          sed -i 's#releases/download/v${VERSION}/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2#releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2#' \
-            scripts/prepare_luna_neural_kws.sh
+          echo "Downloading official Sherpa-ONNX GigaSpeech KWS model..."
 
-          bash scripts/prepare_luna_neural_kws.sh
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            "$MODEL_URL" \
+            --output "$TMP/kws.tar.bz2"
+
+          test -s "$TMP/kws.tar.bz2"
+
+          echo "Extracting model..."
+
+          tar -xjf "$TMP/kws.tar.bz2" -C "$TMP"
+
+          MODEL_DIR="$TMP/$MODEL_NAME"
+
+          test -d "$MODEL_DIR"
+
+          echo "Checking official model files..."
+
+          test -s "$MODEL_DIR/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+          test -s "$MODEL_DIR/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+          test -s "$MODEL_DIR/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+          test -s "$MODEL_DIR/tokens.txt"
+          test -s "$MODEL_DIR/bpe.model"
+
+          echo "Copying neural model files..."
+
+          cp \
+            "$MODEL_DIR/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx" \
+            "$ASSETS/encoder.int8.onnx"
+
+          cp \
+            "$MODEL_DIR/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx" \
+            "$ASSETS/decoder.int8.onnx"
+
+          cp \
+            "$MODEL_DIR/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx" \
+            "$ASSETS/joiner.int8.onnx"
+
+          cp \
+            "$MODEL_DIR/tokens.txt" \
+            "$ASSETS/tokens.txt"
+
+          echo "Generating Luna keyword from the actual model vocabulary..."
+
+          python3 - "$MODEL_DIR" "$ASSETS" <<'PY'
+          from pathlib import Path
+          import sys
+          import sentencepiece as spm
+
+          model_dir = Path(sys.argv[1])
+          assets_dir = Path(sys.argv[2])
+
+          tokens_path = model_dir / "tokens.txt"
+          bpe_model_path = model_dir / "bpe.model"
+          output_path = assets_dir / "keywords.txt"
+
+          # Load the exact vocabulary used by the downloaded neural model.
+          token_table = set()
+
+          for raw_line in tokens_path.read_text(
+              encoding="utf-8"
+          ).splitlines():
+              parts = raw_line.strip().split()
+
+              if len(parts) == 2:
+                  token_table.add(parts[0])
+
+          print(f"Loaded {len(token_table)} model tokens.")
+
+          # Load the exact SentencePiece model belonging to the KWS model.
+          sp = spm.SentencePieceProcessor()
+          if not sp.load(str(bpe_model_path)):
+              raise SystemExit("Could not load the official BPE model.")
+
+          # We prefer the uppercase spelling because the official
+          # GigaSpeech KWS examples use uppercase English keywords.
+          candidates = [
+              "LUNA",
+              "Luna",
+              "luna",
+          ]
+
+          selected_phrase = None
+          selected_tokens = None
+
+          # First use SentencePiece's own segmentation.
+          for phrase in candidates:
+              pieces = sp.encode(
+                  phrase,
+                  out_type=str
+              )
+
+              print(
+                  f"SentencePiece {phrase!r} -> {pieces}"
+              )
+
+              if pieces and all(
+                  piece in token_table
+                  for piece in pieces
+              ):
+                  selected_phrase = phrase
+                  selected_tokens = pieces
+                  break
+
+          # If the best segmentation contains an OOV piece,
+          # search alternative SentencePiece segmentations.
+          if selected_tokens is None:
+              for phrase in candidates:
+                  try:
+                      alternatives = sp.nbest_encode_as_pieces(
+                          phrase,
+                          n=256
+                      )
+                  except Exception:
+                      alternatives = []
+
+                  for pieces in alternatives:
+                      if pieces and all(
+                          piece in token_table
+                          for piece in pieces
+                      ):
+                          selected_phrase = phrase
+                          selected_tokens = pieces
+                          break
+
+                  if selected_tokens is not None:
+                      break
+
+          if selected_tokens is None:
+              raise SystemExit(
+                  "Could not find a valid Luna BPE tokenization "
+                  "whose tokens all exist in the official model "
+                  "tokens.txt."
+              )
+
+          print(
+              "Selected Luna spelling:",
+              selected_phrase
+          )
+
+          print(
+              "Selected BPE tokens:",
+              selected_tokens
+          )
+
+          # The @Luna suffix preserves the human-readable keyword
+          # name while the preceding tokens are what the neural KWS
+          # engine actually matches.
+          keyword_line = (
+              " ".join(selected_tokens)
+              + " :1.5 #0.25 @Luna"
+          )
+
+          output_path.write_text(
+              keyword_line + "\n",
+              encoding="utf-8"
+          )
+
+          # Final hard validation.
+          generated = output_path.read_text(
+              encoding="utf-8"
+          ).strip()
+
+          if not generated:
+              raise SystemExit(
+                  "keywords.txt was generated empty."
+              )
+
+          generated_tokens = generated.split()
+
+          for token in selected_tokens:
+              if token not in token_table:
+                  raise SystemExit(
+                      f"Generated invalid token: {token!r}"
+                  )
+
+          print("Generated keywords.txt:")
+          print(generated)
+
+          print("Keyword token validation passed.")
+          PY
+
+          echo "Downloading official Sherpa-ONNX Android AAR..."
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-all-errors \
+            "$AAR_URL" \
+            --output "$LIBS/sherpa-onnx-${VERSION}.aar"
+
+          test -s "$LIBS/sherpa-onnx-${VERSION}.aar"
+
+          cat > "$ASSETS/MODEL_SOURCE.txt" <<EOF
+          Official Sherpa-ONNX GigaSpeech Zipformer KWS model
+          Sherpa-ONNX version: ${VERSION}
+          Keyword: Luna
+          Model: ${MODEL_NAME}
+          Model source: https://github.com/k2-fsa/sherpa-onnx
+          Runtime: Sherpa-ONNX Android AAR ${VERSION}
+          Keyword tokens generated from the official model BPE vocabulary.
+          EOF
+
+          echo
+          echo "===== NEURAL MODEL FILES ====="
+          ls -lh "$ASSETS"
+
+          echo
+          echo "===== SHERPA AAR ====="
+          ls -lh "$LIBS/sherpa-onnx-${VERSION}.aar"
+
+          echo
+          echo "===== KEYWORDS ====="
+          cat "$ASSETS/keywords.txt"
 
       - name: Verify neural assets
         working-directory: project
         run: |
+          set -euo pipefail
+
+          echo "Checking neural KWS assets..."
+
           test -s app/src/main/assets/luna_kws/encoder.int8.onnx
           test -s app/src/main/assets/luna_kws/decoder.int8.onnx
           test -s app/src/main/assets/luna_kws/joiner.int8.onnx
           test -s app/src/main/assets/luna_kws/tokens.txt
           test -s app/src/main/assets/luna_kws/keywords.txt
+          test -s app/src/main/assets/luna_kws/MODEL_SOURCE.txt
+
           test -s app/libs/sherpa-onnx-1.13.8.aar
+
+          echo
+          echo "Neural assets:"
+          ls -lh app/src/main/assets/luna_kws
+
+          echo
+          echo "Sherpa AAR:"
+          ls -lh app/libs/sherpa-onnx-1.13.8.aar
+
+          echo
+          echo "Keyword configuration:"
+          cat app/src/main/assets/luna_kws/keywords.txt
+
+          echo
+          echo "All neural assets verified."
+
+      - name: Verify Sherpa dependency wiring
+        working-directory: project
+        run: |
+          set -euo pipefail
+
+          grep -F \
+            'implementation(files("libs/sherpa-onnx-1.13.8.aar"))' \
+            app/build.gradle.kts
+
+          grep -F \
+            'com.k2fsa.sherpa.onnx' \
+            app/src/main/java/com/example/voice/LunaWakeWordEngine.kt
+
+          grep -F \
+            'KeywordSpotter' \
+            app/src/main/java/com/example/voice/LunaWakeWordEngine.kt
+
+          echo "Sherpa-ONNX dependency wiring verified."
+
+      - name: Verify Android project configuration
+        working-directory: project
+        run: |
+          set -euo pipefail
+
+          grep -F \
+            'compileSdk { version = release(36) { minorApiLevel = 1 } }' \
+            app/build.gradle.kts
+
+          grep -F \
+            'minSdk = 26' \
+            app/build.gradle.kts
+
+          grep -F \
+            'targetSdk = 36' \
+            app/build.gradle.kts
+
+          echo "Android project configuration verified."
 
       - name: Build debug APK
         working-directory: project
         run: |
+          set -euo pipefail
+
           gradle :app:assembleDebug --stacktrace
 
       - name: Verify APK
         working-directory: project
         run: |
-          test -s app/build/outputs/apk/debug/app-debug.apk
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
+          set -euo pipefail
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          test -s "$APK"
+
+          echo
+          echo "===== APK ====="
+          ls -lh "$APK"
+
+          echo
+          echo "APK SHA-256:"
+          sha256sum "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
