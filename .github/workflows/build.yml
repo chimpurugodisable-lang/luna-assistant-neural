@@ -39,6 +39,51 @@ jobs:
 
           echo "LUNA project extracted and verified."
 
+      - name: Fix Kotlin source before build
+        working-directory: project
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path(
+              "app/src/main/java/com/example/service/LunaVoiceService.kt"
+          )
+
+          if not p.exists():
+              raise SystemExit(
+                  f"Expected Kotlin source was not found: {p}"
+              )
+
+          s = p.read_text(encoding="utf-8")
+
+          old = '"Genuine on-device neural "Luna" wake-word model active"'
+          new = '"Genuine on-device neural \\"Luna\\" wake-word model active"'
+
+          if old in s:
+              s = s.replace(old, new, 1)
+              p.write_text(s, encoding="utf-8")
+              print("Fixed malformed LunaVoiceService.kt string literal.")
+          elif new in s:
+              print("LunaVoiceService.kt is already corrected.")
+          else:
+              raise SystemExit(
+                  "Expected Luna wake-word status string was not found. "
+                  "The source may have changed unexpectedly."
+              )
+          PY
+
+          echo
+          echo "===== VERIFYING KOTLIN SOURCE ====="
+
+          grep -F \
+            'Genuine on-device neural \"Luna\" wake-word model active' \
+            app/src/main/java/com/example/service/LunaVoiceService.kt
+
+          echo
+          echo "Kotlin source verification passed."
+
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
@@ -116,6 +161,7 @@ jobs:
           echo "Installing model-preparation dependencies..."
 
           python3 -m pip install --quiet --upgrade pip
+
           python3 -m pip install --quiet \
             "sentencepiece" \
             "pypinyin" \
@@ -143,9 +189,15 @@ jobs:
 
           echo "Checking official model files..."
 
-          test -s "$MODEL_DIR/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
-          test -s "$MODEL_DIR/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
-          test -s "$MODEL_DIR/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+          test -s \
+            "$MODEL_DIR/encoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+
+          test -s \
+            "$MODEL_DIR/decoder-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+
+          test -s \
+            "$MODEL_DIR/joiner-epoch-12-avg-2-chunk-16-left-64.int8.onnx"
+
           test -s "$MODEL_DIR/tokens.txt"
           test -s "$MODEL_DIR/bpe.model"
 
@@ -181,7 +233,8 @@ jobs:
           bpe_model_path = model_dir / "bpe.model"
           output_path = assets_dir / "keywords.txt"
 
-          # Load the exact vocabulary used by the downloaded neural model.
+          # Load the exact vocabulary used by the downloaded
+          # neural model.
           token_table = set()
 
           for raw_line in tokens_path.read_text(
@@ -194,13 +247,16 @@ jobs:
 
           print(f"Loaded {len(token_table)} model tokens.")
 
-          # Load the exact SentencePiece model belonging to the KWS model.
+          # Load the exact SentencePiece model belonging
+          # to the official KWS model.
           sp = spm.SentencePieceProcessor()
-          if not sp.load(str(bpe_model_path)):
-              raise SystemExit("Could not load the official BPE model.")
 
-          # We prefer the uppercase spelling because the official
-          # GigaSpeech KWS examples use uppercase English keywords.
+          if not sp.load(str(bpe_model_path)):
+              raise SystemExit(
+                  "Could not load the official BPE model."
+              )
+
+          # Try common spellings.
           candidates = [
               "LUNA",
               "Luna",
@@ -210,7 +266,7 @@ jobs:
           selected_phrase = None
           selected_tokens = None
 
-          # First use SentencePiece's own segmentation.
+          # First use SentencePiece's normal segmentation.
           for phrase in candidates:
               pieces = sp.encode(
                   phrase,
@@ -229,7 +285,7 @@ jobs:
                   selected_tokens = pieces
                   break
 
-          # If the best segmentation contains an OOV piece,
+          # If normal segmentation contains an OOV piece,
           # search alternative SentencePiece segmentations.
           if selected_tokens is None:
               for phrase in candidates:
@@ -270,9 +326,8 @@ jobs:
               selected_tokens
           )
 
-          # The @Luna suffix preserves the human-readable keyword
-          # name while the preceding tokens are what the neural KWS
-          # engine actually matches.
+          # The @Luna suffix is the human-readable keyword name.
+          # The BPE tokens are what the neural KWS engine matches.
           keyword_line = (
               " ".join(selected_tokens)
               + " :1.5 #0.25 @Luna"
@@ -283,7 +338,6 @@ jobs:
               encoding="utf-8"
           )
 
-          # Final hard validation.
           generated = output_path.read_text(
               encoding="utf-8"
           ).strip()
@@ -292,8 +346,6 @@ jobs:
               raise SystemExit(
                   "keywords.txt was generated empty."
               )
-
-          generated_tokens = generated.split()
 
           for token in selected_tokens:
               if token not in token_table:
