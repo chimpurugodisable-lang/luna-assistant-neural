@@ -63,9 +63,13 @@ jobs:
         working-directory: project
         run: |
           python3 -m pip install --quiet --upgrade pip
-          python3 -m pip install --quiet sentencepiece
 
-          sed -i 's#releases/download/v${VERSION}/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2#releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2#' scripts/prepare_luna_neural_kws.sh
+          python3 -m pip install --quiet \
+            sentencepiece \
+            pypinyin
+
+          sed -i 's#releases/download/v${VERSION}/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2#releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2#' \
+            scripts/prepare_luna_neural_kws.sh
 
           bash scripts/prepare_luna_neural_kws.sh
 
